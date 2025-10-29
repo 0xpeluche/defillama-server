@@ -29,6 +29,11 @@ const skipDefaultRecentDataCheckForAdapters = new Set([
   '5060',  // derive options
 ])
 
+const sleep = (ms: number) => new Promise(res => setTimeout(res, ms));
+const PROTOCOL_STAGGER_MS = +(process.env.PROTOCOL_STAGGER_MS ?? 0);
+const PROTOCOL_STAGGER_JITTER_MS = +(process.env.PROTOCOL_STAGGER_JITTER_MS ?? 0);
+const PROTOCOL_STAGGER_FIRST_WAVE_ONLY = (process.env.PROTOCOL_STAGGER_FIRST_WAVE_ONLY ?? 'true') === 'true';
+
 export type DimensionRunOptions = {
   timestamp?: number
   adapterType: AdapterType
@@ -147,6 +152,18 @@ export const handler2 = async (options: DimensionRunOptions) => {
     .withConcurrency(maxConcurrency)
     .for(protocols)
     .process(async (protocol: ProtocolAdaptor, index: number) => {
+      if (!isRunFromRefillScript && PROTOCOL_STAGGER_MS > 0) {
+        const inFirstWave = index < maxConcurrency;
+        if (!PROTOCOL_STAGGER_FIRST_WAVE_ONLY || inFirstWave) {
+          const waveIdx = index % maxConcurrency;
+          const jitter = PROTOCOL_STAGGER_JITTER_MS
+            ? Math.floor((Math.random() * 2 - 1) * PROTOCOL_STAGGER_JITTER_MS)
+            : 0;
+          const delay = Math.max(0, waveIdx * PROTOCOL_STAGGER_MS + jitter);
+          if (delay) await sleep(delay);
+        }
+      }
+
       const startTime = Date.now()
       try {
         const result = await runAndStoreProtocol(protocol, index)
@@ -374,7 +391,7 @@ export const handler2 = async (options: DimensionRunOptions) => {
       // dynamically import runAdapter so we import it only if needed and after the repo is setup
       const runAdapter = (await import("../../../../dimension-adapters/adapters/utils/runAdapter")).default
 
-      const { adaptorRecordV2JSON, breakdownByToken, } = await runAdapter({ module: adaptor, endTimestamp, name: module, withMetadata: true, cacheResults: runType === 'store-all', deadChains, },) as any
+      const { adaptorRecordV2JSON, breakdownByToken, } = await runAdapter({ module: adaptor, endTimestamp, name: module, withMetadata: true, cacheResults: runType === 'store-all', deadChains } as any)
       convertRecordTypeToKeys(adaptorRecordV2JSON, KEYS_TO_STORE)  // remove unmapped record types and convert keys to short names
 
 

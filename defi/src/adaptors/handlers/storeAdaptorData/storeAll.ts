@@ -1,37 +1,134 @@
-import '../../../api2/utils/failOnError'
+import '../../../api2/utils/failOnError';
 
-import { handler2 } from ".";
-import { AdapterType } from "../../data/types"
-import { getUnixTimeNow } from '../../../api2/utils/time';
-import { getTimestampAtStartOfDayUTC } from '../../../utils/date';
 import { elastic } from '@defillama/sdk';
-import { getAllDimensionsRecordsOnDate } from '../../db-utils/db2';
-import { ADAPTER_TYPES } from '../../data/types';
-import loadAdaptorsData from '../../data';
+import { handler2 } from ".";
+import { getUnixTimeNow } from '../../../api2/utils/time';
 import { deadChains } from '../../../storeTvlInterval/getAndStoreTvl';
-const MAX_RUNTIME = 1000 * 60 * +(process.env.MAX_RUNTIME_MINUTES ?? 50); // 50 minutes default
-const onlyYesterday = process.env.ONLY_YESTERDAY === 'true';  // if set, we refill only yesterday's missing data
+import { getTimestampAtStartOfDayUTC } from '../../../utils/date';
+import loadAdaptorsData from '../../data';
+import { ADAPTER_TYPES, AdapterType } from "../../data/types";
+import { getAllDimensionsRecordsOnDate } from '../../db-utils/db2';
 
-let maxConcurrency = 21; // default
+const onlyYesterday = process.env.ONLY_YESTERDAY === 'true';
+
+let maxConcurrency = 21;
 if (process.env.DIM_RUN_MAX_CONCURRENCY) {
   const parsed = parseInt(process.env.DIM_RUN_MAX_CONCURRENCY);
-  if (!isNaN(parsed)) {
-    maxConcurrency = parsed;
-  }
+  if (!isNaN(parsed)) maxConcurrency = parsed;
 }
 
-console.log('This will run with MAX_RUNTIME:', MAX_RUNTIME / 60000, 'minutes');
+const adapterTypeStaggerDelay = +(process.env.ADAPTER_TYPE_STAGGER_DELAY_MS ?? 2000);
+const adapterTypeJitterMs = +(process.env.ADAPTER_TYPE_JITTER_MS ?? 1500);
+const startupJitterMs = +(process.env.STARTUP_JITTER_MS ?? 60000);
+
+// category concurrency (CATEGORY_CONC_MAX has priority; fallback to legacy CATEGORY_CONCURRENCY)
+const categoryConcMax = +(process.env.CATEGORY_CONC_MAX ?? process.env.CATEGORY_CONCURRENCY ?? 10);
+let   categoryConcStart = +(process.env.CATEGORY_CONC_START ?? Math.min(4, categoryConcMax));
+const categoryConcRampMs = +(process.env.CATEGORY_CONC_RAMP_MS ?? 120000);
+if (categoryConcStart > categoryConcMax) categoryConcStart = categoryConcMax;
+
+// timer config
+const MAX_RUNTIME = 1000 * 60 * +(process.env.MAX_RUNTIME_MINUTES ?? 50);
+const MAX_RUNTIME_HARD_CAP_MINUTES = process.env.MAX_RUNTIME_HARD_CAP_MINUTES ? +process.env.MAX_RUNTIME_HARD_CAP_MINUTES : Number.POSITIVE_INFINITY;
+const USE_TIMEOUT_AUTO_BUFFER = (process.env.USE_TIMEOUT_AUTO_BUFFER ?? 'true') === 'true';
+const TIMEOUT_BUFFER_MS_ENV = process.env.TIMEOUT_BUFFER_MS ? +process.env.TIMEOUT_BUFFER_MS : null;
+const SOFT_STOP_MS = +(process.env.SOFT_STOP_MS ?? 90_000);
+
+function estimateDelayBufferMs(numCategories: number) {
+  const b1 = numCategories * adapterTypeStaggerDelay + adapterTypeJitterMs + startupJitterMs;
+  const b2 = (numCategories / Math.max(1, categoryConcStart)) * adapterTypeStaggerDelay + adapterTypeJitterMs + startupJitterMs;
+  return Math.min(b1, b2);
+}
+const numCategories = ADAPTER_TYPES.length;
+const AUTO_BUFFER_MS = USE_TIMEOUT_AUTO_BUFFER ? estimateDelayBufferMs(numCategories) : 0;
+const EFFECTIVE_BUFFER_MS = TIMEOUT_BUFFER_MS_ENV ?? AUTO_BUFFER_MS;
+const adjustedMaxRuntime = Math.min(MAX_RUNTIME + EFFECTIVE_BUFFER_MS, MAX_RUNTIME_HARD_CAP_MINUTES * 60_000);
+
+function sleep(ms: number) { return new Promise(res => setTimeout(res, ms)); }
 
 async function run() {
-  const startTimeAll = getUnixTimeNow()
-  console.time("**** Run All Adaptor types")
+  // minimal startup config logs
+  console.log('[config] runtimeMin=%s bufferMs=%s hardCapMin=%s adjustedMs=%s',
+    (MAX_RUNTIME/60000).toFixed(2),
+    EFFECTIVE_BUFFER_MS,
+    Number.isFinite(MAX_RUNTIME_HARD_CAP_MINUTES) ? MAX_RUNTIME_HARD_CAP_MINUTES : 'none',
+    adjustedMaxRuntime
+  );
+  console.log('[config] catConc %s -> %s (ramp %sms) | jitterStart=%sms | typeStagger=%sms±%sms',
+    categoryConcStart, categoryConcMax, categoryConcRampMs,
+    startupJitterMs,
+    adapterTypeStaggerDelay, adapterTypeJitterMs
+  );
 
-  await Promise.all(ADAPTER_TYPES.map(runAdapterType))
+  const startTimeAllUnix = getUnixTimeNow();
+  const startTimeAllMs = Date.now();
+  console.time("**** Run All Adaptor types");
 
-  // const randomizedAdapterTypes = [...ADAPTER_TYPES].sort(() => Math.random() - 0.5)
-  // for (const adapterType of randomizedAdapterTypes) {
-  //   await runAdapterType(adapterType)
-  // }
+  if (startupJitterMs > 0) {
+    const startupDelay = Math.floor(Math.random() * startupJitterMs);
+    await sleep(startupDelay);
+  }
+
+  let currentCategoryCap = categoryConcStart;
+  setTimeout(() => {
+    currentCategoryCap = categoryConcMax;
+    console.log(`[ramp] category concurrency -> ${categoryConcMax}`);
+  }, categoryConcRampMs);
+
+  const randomizedAdapterTypes = [...ADAPTER_TYPES].sort(() => Math.random() - 0.5);
+
+  let running = 0;
+  let launched = 0;
+  const queue: Array<{ promise: Promise<void>; done: boolean }> = [];
+
+  for (let i = 0; i < randomizedAdapterTypes.length; i++) {
+    const adapterType = randomizedAdapterTypes[i];
+
+    const elapsedMs = Date.now() - startTimeAllMs;
+    if (elapsedMs > adjustedMaxRuntime - SOFT_STOP_MS) {
+      const remaining = randomizedAdapterTypes.length - i;
+      const left = Math.max(0, Math.floor((adjustedMaxRuntime - elapsedMs)/1000));
+      console.warn(`[soft-stop] ${left}s remaining, skipping ${remaining} categories`);
+      break;
+    }
+
+    while (running >= currentCategoryCap) {
+      const inflight = queue.filter(item => !item.done).map(item => item.promise);
+      if (inflight.length === 0) break;
+      await Promise.race(inflight);
+      for (let k = queue.length - 1; k >= 0; k--) if (queue[k].done) queue.splice(k, 1);
+    }
+
+    const baseDelay = launched * adapterTypeStaggerDelay;
+    const jitter = Math.floor((Math.random() * 2 - 1) * adapterTypeJitterMs);
+    const delay = Math.max(0, baseDelay + jitter);
+    launched += 1;
+
+    const queueItem: { promise: Promise<void>; done: boolean } = { promise: Promise.resolve(), done: false };
+
+    queueItem.promise = (async () => {
+      try {
+        running++;
+        if (delay > 0) await sleep(delay);
+        await runAdapterType(adapterType);
+      } finally {
+        running--;
+        queueItem.done = true;
+      }
+    })();
+
+    queue.push(queueItem);
+  }
+
+  await Promise.allSettled(queue.map(item => item.promise));
+
+  console.timeEnd("**** Run All Adaptor types");
+  const endTimeAll = getUnixTimeNow();
+  await elastic.addRuntimeLog({
+    runtime: endTimeAll - startTimeAllUnix,
+    success: true,
+    metadata: { application: "dimensions", type: 'all', name: 'all' }
+  });
 
   async function runAdapterType(adapterType: AdapterType) {
     const startTimeCategory = getUnixTimeNow()
@@ -71,11 +168,8 @@ async function run() {
         for (const protocol of protocolAdaptors) {
           const id2 = protocol.id2;
           const yesterdayRecord = yesterdayDataMap.get(id2);
-
           // If no yesterday data exists, don't add to set (will trigger refill)
-          if (!yesterdayRecord) {
-            continue;
-          }
+          if (!yesterdayRecord) continue;
 
           let includeInSet = true;
 
@@ -86,7 +180,6 @@ async function run() {
             const hasDuneDependency = adaptor.dependencies?.includes('dune' as any) ?? false;
             const isV1 = version === 1;
             const isV2 = !isV1;
-
             // Edge case 1: V2 adapters (not runAtCurrTime) with incomplete yesterday data
             // Only applies to V2 adapters that don't run at current time
             // Remove from set to trigger refill for incomplete data after 01:00 UTC
@@ -101,7 +194,6 @@ async function run() {
             if (includeInSet && isV1 && hasDuneDependency && yesterdayRecord.updatedAt && isAfter8AM) {
               const lastUpdateDate = new Date(yesterdayRecord.updatedAt * 1000);
               const lastUpdateHourUTC = lastUpdateDate.getUTCHours();
-
               if (lastUpdateHourUTC < 8) {
                 includeInSet = false;
                 console.log(`Removing ${id2} from yesterdayIdSet - V1 DUNE adapter needs refresh (last update: ${lastUpdateDate.toISOString()}, before 08:00 UTC)`)
@@ -109,19 +201,27 @@ async function run() {
             }
           } catch (e) {
             console.error(`importModule error for ${id2} - ${protocol.module}: ${e}`)
-            // If we can't load module, include by default to avoid breaking existing adapters
             includeInSet = true;
           }
 
-          if (includeInSet) {
-            yesterdayIdSet.add(id2);
-          }
+          if (includeInSet) yesterdayIdSet.add(id2);
         }
-
       } catch (e) {
         console.error("Error in getAllDimensionsRecordsOnDate", e)
       }
-      await handler2({ adapterType, yesterdayIdSet, runType: 'store-all', todayIdSet, maxRunTime: MAX_RUNTIME - 2 * 60 * 1000, onlyYesterday, maxConcurrency, deadChains })
+
+      await handler2({
+        adapterType,
+        yesterdayIdSet,
+        runType: 'store-all',
+        todayIdSet,
+        maxRunTime: MAX_RUNTIME - 2 * 60 * 1000,
+        onlyYesterday,
+        maxConcurrency,
+        deadChains,
+      });
+
+      success = true;
 
     } catch (e) {
       console.error("error", e)
@@ -135,8 +235,8 @@ async function run() {
       })
     }
 
-    console.timeEnd(key)
-    const endTimeCategory = getUnixTimeNow()
+    console.timeEnd(key);
+    const endTimeCategory = getUnixTimeNow();
     await elastic.addRuntimeLog({
       runtime: endTimeCategory - startTimeCategory,
       success,
@@ -146,26 +246,13 @@ async function run() {
         category: adapterType,
       }
     })
-
   }
-
-  console.timeEnd("**** Run All Adaptor types")
-  const endTimeAll = getUnixTimeNow()
-  await elastic.addRuntimeLog({
-    runtime: endTimeAll - startTimeAll,
-    success: true,
-    metadata: {
-      application: "dimensions",
-      type: 'all',
-      name: 'all',
-    }
-  })
 }
 
 setTimeout(() => {
   console.error("Timeout reached, exiting from dimensions-store-all...")
   process.exit(1)
-}, MAX_RUNTIME)
+}, adjustedMaxRuntime)
 
 run().catch((e) => {
   console.error("Error in dimensions-store-all", e)
